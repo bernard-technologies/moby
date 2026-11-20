@@ -714,6 +714,22 @@ func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64
 	return directory.Size(context.TODO(), applyDir)
 }
 
+// LayerDirectories lists real directories for report-only startup diagnostics.
+// An entry in this list says nothing about ownership.
+func (d *Driver) LayerDirectories() ([]string, error) {
+	entries, err := os.ReadDir(d.home)
+	if err != nil {
+		return nil, err
+	}
+	var dirs []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirs = append(dirs, entry.Name())
+		}
+	}
+	return dirs, nil
+}
+
 func (d *Driver) getDiffPath(id string) string {
 	dir := d.dir(id)
 

@@ -108,9 +108,11 @@ func newStoreFromGraphDriver(root string, driver graphdriver.Driver, os string) 
 		return nil, err
 	}
 
+	incomplete := false
 	for _, id := range ids {
 		l, err := ls.loadLayer(id)
 		if err != nil {
+			incomplete = true
 			logrus.Debugf("Failed to load layer %s: %s", id, err)
 			continue
 		}
@@ -121,10 +123,14 @@ func newStoreFromGraphDriver(root string, driver graphdriver.Driver, os string) 
 
 	for _, mount := range mounts {
 		if err := ls.loadMount(mount); err != nil {
+			incomplete = true
 			logrus.Debugf("Failed to load mount %s: %s", mount, err)
 		}
 	}
 
+	if scanner, ok := driver.(interface{ LayerDirectories() ([]string, error) }); ok {
+		ls.reportInterruptedLayers(scanner, incomplete)
+	}
 	return ls, nil
 }
 
