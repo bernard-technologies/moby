@@ -68,6 +68,7 @@ import (
 	"github.com/docker/libnetwork/cluster"
 	nwconfig "github.com/docker/libnetwork/config"
 	"github.com/moby/locker"
+	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/semaphore"
 )
@@ -1024,7 +1025,14 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 	}
 
 	imageRoot := filepath.Join(config.Root, "image", d.graphDrivers[runtime.GOOS])
-	ifs, err := image.NewFSStoreBackend(filepath.Join(imageRoot, "imagedb"))
+	durablePulls := runtime.GOOS == "linux" && d.graphDrivers[runtime.GOOS] == "overlay2"
+	imageDB := filepath.Join(imageRoot, "imagedb")
+	var ifs image.StoreBackend
+	if durablePulls {
+		ifs, err = image.NewDurableFSStoreBackend(imageDB, config.Root)
+	} else {
+		ifs, err = image.NewFSStoreBackend(imageDB)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1065,7 +1073,18 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 	// For backwards compatibility, we just put it under the windowsfilter
 	// directory regardless.
 	refStoreLocation := filepath.Join(imageRoot, `repositories.json`)
-	rs, err := refstore.NewReferenceStore(refStoreLocation)
+	var rs refstore.Store
+	if durablePulls {
+		rs, err = refstore.NewDurableReferenceStore(refStoreLocation, func(id digest.Digest) error {
+			registered, err := imageStore.Search(id.String())
+			if err != nil || registered.Digest() != id {
+				return fmt.Errorf("cannot reference unregistered image %s", id)
+			}
+			return nil
+		})
+	} else {
+		rs, err = refstore.NewReferenceStore(refStoreLocation)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("Couldn't create reference store repository: %s", err)
 	}

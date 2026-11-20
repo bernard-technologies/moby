@@ -46,6 +46,16 @@ type store struct {
 	// referencesByIDCache is a cache of references indexed by ID, to speed
 	// up References.
 	referencesByIDCache map[digest.Digest]map[string]reference.Named
+	// A durable write may have renamed the file without being able to sync
+	// its parent. Keep the old indexes until that sync succeeds.
+	durableWrite func(string, []byte, os.FileMode) (bool, error)
+	pending      *pendingReferenceUpdate
+	checkImage   func(digest.Digest) error
+}
+
+type pendingReferenceUpdate struct {
+	repos map[string]repository
+	apply func()
 }
 
 // Repository maps tags to digests. The key is a stringified Reference,
@@ -71,6 +81,17 @@ func (a lexicalAssociations) Less(i, j int) bool {
 // NewReferenceStore creates a new reference store, tied to a file path where
 // the set of references are serialized in JSON format.
 func NewReferenceStore(jsonPath string) (Store, error) {
+	return newReferenceStore(jsonPath, false, nil)
+}
+
+// NewDurableReferenceStore persists reference updates for the classic
+// overlay2 store. checkImage runs under the reference lock before adding a
+// reference and must not call back into the reference store.
+func NewDurableReferenceStore(jsonPath string, checkImage func(digest.Digest) error) (Store, error) {
+	return newReferenceStore(jsonPath, true, checkImage)
+}
+
+func newReferenceStore(jsonPath string, durable bool, checkImage func(digest.Digest) error) (Store, error) {
 	abspath, err := filepath.Abs(jsonPath)
 	if err != nil {
 		return nil, err
@@ -80,6 +101,14 @@ func NewReferenceStore(jsonPath string) (Store, error) {
 		jsonPath:            abspath,
 		Repositories:        make(map[string]repository),
 		referencesByIDCache: make(map[digest.Digest]map[string]reference.Named),
+	}
+	if durable {
+		store.durableWrite = ioutils.DurableAtomicWriteFile
+		store.checkImage = checkImage
+		// Reconcile a rename left visible across a daemon restart.
+		if err := ioutils.SyncDir(filepath.Dir(abspath)); err != nil {
+			return nil, err
+		}
 	}
 	// Load the json file if it exists, otherwise create it.
 	if err := store.reload(); os.IsNotExist(err) {
@@ -139,14 +168,18 @@ func (store *store) addReference(ref reference.Named, id digest.Digest, force bo
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
-
-	repository, exists := store.Repositories[refName]
-	if !exists || repository == nil {
-		repository = make(map[string]digest.Digest)
-		store.Repositories[refName] = repository
+	if err := store.syncPending(); err != nil {
+		return err
 	}
 
-	oldID, exists := repository[refStr]
+	if store.checkImage != nil {
+		if err := store.checkImage(id); err != nil {
+			return err
+		}
+	}
+
+	repo := store.Repositories[refName]
+	oldID, exists := repo[refStr]
 
 	if exists {
 		if oldID == id {
@@ -166,22 +199,22 @@ func (store *store) addReference(ref reference.Named, id digest.Digest, force bo
 				),
 			)
 		}
+	}
 
-		if store.referencesByIDCache[oldID] != nil {
+	next := copyRepository(repo)
+	next[refStr] = id
+	return store.saveUpdate(refName, next, func() {
+		if exists && store.referencesByIDCache[oldID] != nil {
 			delete(store.referencesByIDCache[oldID], refStr)
 			if len(store.referencesByIDCache[oldID]) == 0 {
 				delete(store.referencesByIDCache, oldID)
 			}
 		}
-	}
-
-	repository[refStr] = id
-	if store.referencesByIDCache[id] == nil {
-		store.referencesByIDCache[id] = make(map[string]reference.Named)
-	}
-	store.referencesByIDCache[id][refStr] = ref
-
-	return store.save()
+		if store.referencesByIDCache[id] == nil {
+			store.referencesByIDCache[id] = make(map[string]reference.Named)
+		}
+		store.referencesByIDCache[id][refStr] = ref
+	})
 }
 
 // Delete deletes a reference from the store. It returns true if a deletion
@@ -199,6 +232,9 @@ func (store *store) Delete(ref reference.Named) (bool, error) {
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if err := store.syncPending(); err != nil {
+		return false, err
+	}
 
 	repository, exists := store.Repositories[refName]
 	if !exists {
@@ -206,17 +242,16 @@ func (store *store) Delete(ref reference.Named) (bool, error) {
 	}
 
 	if id, exists := repository[refStr]; exists {
-		delete(repository, refStr)
-		if len(repository) == 0 {
-			delete(store.Repositories, refName)
-		}
-		if store.referencesByIDCache[id] != nil {
-			delete(store.referencesByIDCache[id], refStr)
-			if len(store.referencesByIDCache[id]) == 0 {
-				delete(store.referencesByIDCache, id)
+		next := copyRepository(repository)
+		delete(next, refStr)
+		return true, store.saveUpdate(refName, next, func() {
+			if store.referencesByIDCache[id] != nil {
+				delete(store.referencesByIDCache[id], refStr)
+				if len(store.referencesByIDCache[id]) == 0 {
+					delete(store.referencesByIDCache, id)
+				}
 			}
-		}
-		return true, store.save()
+		})
 	}
 
 	return false, ErrDoesNotExist
@@ -242,8 +277,11 @@ func (store *store) Get(ref reference.Named) (digest.Digest, error) {
 	refName := reference.FamiliarName(ref)
 	refStr := reference.FamiliarString(ref)
 
-	store.mu.RLock()
-	defer store.mu.RUnlock()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.syncPending(); err != nil {
+		return "", err
+	}
 
 	repository, exists := store.Repositories[refName]
 	if !exists || repository == nil {
@@ -312,12 +350,93 @@ func (store *store) ReferencesByName(ref reference.Named) []Association {
 }
 
 func (store *store) save() error {
-	// Store the json
-	jsonData, err := json.Marshal(store)
+	_, err := store.writeRepositories(store.Repositories)
+	return err
+}
+
+func (store *store) writeRepositories(repos map[string]repository) (bool, error) {
+	jsonData, err := json.Marshal(struct{ Repositories map[string]repository }{repos})
 	if err != nil {
+		return false, err
+	}
+	if store.durableWrite != nil {
+		return store.durableWrite(store.jsonPath, jsonData, 0600)
+	}
+	err = ioutils.AtomicWriteFile(store.jsonPath, jsonData, 0600)
+	return err == nil, err
+}
+
+func copyRepository(repo repository) repository {
+	result := make(repository, len(repo))
+	for ref, id := range repo {
+		result[ref] = id
+	}
+	return result
+}
+
+func setRepository(repos map[string]repository, name string, repo repository) {
+	if len(repo) == 0 {
+		delete(repos, name)
+	} else {
+		repos[name] = repo
+	}
+}
+
+// saveUpdate is called with mu held.
+func (store *store) saveUpdate(name string, next repository, updateIndex func()) error {
+	apply := func() {
+		setRepository(store.Repositories, name, next)
+		updateIndex()
+	}
+	if store.durableWrite == nil {
+		apply()
+		return store.save()
+	}
+	repos := make(map[string]repository, len(store.Repositories))
+	for name, repo := range store.Repositories {
+		repos[name] = repo
+	}
+	setRepository(repos, name, next)
+	renamed, err := store.writeRepositories(repos)
+	if err == nil {
+		apply()
+	} else if renamed {
+		store.pending = &pendingReferenceUpdate{repos: repos, apply: apply}
+	}
+	return err
+}
+
+func (store *store) syncPending() error {
+	if store.pending == nil {
+		return nil
+	}
+	// Rewrite the intended file, not just fsync again: a writeback error
+	// may already have been reported and need not be returned twice.
+	if _, err := store.writeRepositories(store.pending.repos); err != nil {
 		return err
 	}
-	return ioutils.AtomicWriteFile(store.jsonPath, jsonData, 0600)
+	store.pending.apply()
+	store.pending = nil
+	return nil
+}
+
+// WithUnreferencedImage serializes durable reference updates against image
+// deletion. Both the old and new image must survive an uncertain rename.
+// remove must not call back into the reference store.
+func WithUnreferencedImage(s Store, id digest.Digest, remove func() error) error {
+	store, ok := s.(*store)
+	if !ok || store.durableWrite == nil {
+		return remove()
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if store.pending != nil {
+		return fmt.Errorf("cannot delete image %s while reference durability is unresolved", id)
+	}
+	if len(store.referencesByIDCache[id]) != 0 {
+		return fmt.Errorf("cannot delete image %s: it still has references", id)
+	}
+	return remove()
 }
 
 func (store *store) reload() error {

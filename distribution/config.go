@@ -134,7 +134,14 @@ func (s *imageConfigStore) Put(_ context.Context, c []byte) (digest.Digest, erro
 }
 
 func (s *imageConfigStore) Get(_ context.Context, d digest.Digest) ([]byte, error) {
-	img, err := s.Store.Get(image.IDFromDigest(d))
+	id := image.IDFromDigest(d)
+	// A config file alone does not prove successful creation: its rename
+	// can be visible even after a failed sync or layer lookup. Only skip
+	// downloading when the config is indexed as a registered image.
+	if registered, err := s.Store.Search(d.String()); err != nil || registered != id {
+		return nil, fmt.Errorf("image %s is not registered", d)
+	}
+	img, err := s.Store.Get(id)
 	if err != nil {
 		return nil, err
 	}

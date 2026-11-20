@@ -10,8 +10,10 @@ import (
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
+	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/pkg/system"
+	refstore "github.com/docker/docker/reference"
 	"github.com/pkg/errors"
 )
 
@@ -326,7 +328,12 @@ func (i *ImageService) imageDeleteHelper(imgID image.ID, records *[]types.ImageD
 		return err
 	}
 
-	removedLayers, err := i.imageStore.Delete(imgID)
+	var removedLayers []layer.Metadata
+	err = refstore.WithUnreferencedImage(i.referenceStore, imgID.Digest(), func() error {
+		var err error
+		removedLayers, err = i.imageStore.Delete(imgID)
+		return err
+	})
 	if err != nil {
 		return err
 	}

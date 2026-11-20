@@ -29,7 +29,8 @@ type StoreBackend interface {
 // fs implements StoreBackend using the filesystem.
 type fs struct {
 	sync.RWMutex
-	root string
+	root    string
+	durable bool
 }
 
 const (
@@ -40,6 +41,30 @@ const (
 // NewFSStoreBackend returns new filesystem based backend for image.Store
 func NewFSStoreBackend(root string) (StoreBackend, error) {
 	return newFSStore(root)
+}
+
+// NewDurableFSStoreBackend adds directory persistence to the classic image
+// store without changing its on-disk format.
+func NewDurableFSStoreBackend(root, dataRoot string) (StoreBackend, error) {
+	s, err := newFSStore(root)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range []string{contentDirName, metadataDirName} {
+		if err := ioutils.SyncDirChain(filepath.Join(root, name, string(digest.Canonical)), dataRoot); err != nil {
+			return nil, err
+		}
+	}
+	s.durable = true
+	return s, nil
+}
+
+func (s *fs) writeFile(path string, data []byte) error {
+	if s.durable {
+		_, err := ioutils.DurableAtomicWriteFile(path, data, 0600)
+		return err
+	}
+	return ioutils.AtomicWriteFile(path, data, 0600)
 }
 
 func newFSStore(root string) (*fs, error) {
@@ -117,7 +142,7 @@ func (s *fs) Set(data []byte) (digest.Digest, error) {
 	}
 
 	dgst := digest.FromBytes(data)
-	if err := ioutils.AtomicWriteFile(s.contentFile(dgst), data, 0600); err != nil {
+	if err := s.writeFile(s.contentFile(dgst), data); err != nil {
 		return "", errors.Wrap(err, "failed to write digest data")
 	}
 
@@ -147,7 +172,12 @@ func (s *fs) SetMetadata(dgst digest.Digest, key string, data []byte) error {
 	if err := os.MkdirAll(baseDir, 0700); err != nil {
 		return err
 	}
-	return ioutils.AtomicWriteFile(filepath.Join(s.metadataDir(dgst), key), data, 0600)
+	if s.durable {
+		if err := ioutils.SyncDirChain(baseDir, s.root); err != nil {
+			return err
+		}
+	}
+	return s.writeFile(filepath.Join(baseDir, key), data)
 }
 
 // GetMetadata returns metadata for a given digest.
