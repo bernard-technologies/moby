@@ -140,7 +140,11 @@ func (gdw *NaiveDiffDriver) ApplyDiff(id, parent string, diff io.Reader) (size i
 	if err != nil {
 		return
 	}
-	defer driver.Put(id)
+	defer func() {
+		if putErr := driver.Put(id); err == nil {
+			err = putErr
+		}
+	}()
 
 	layerFs := layerRootFs.Path()
 	options := &archive.TarOptions{UIDMaps: gdw.uidMaps,

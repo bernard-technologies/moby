@@ -32,8 +32,9 @@ type fileMetadataStore struct {
 }
 
 type fileMetadataTransaction struct {
-	store *fileMetadataStore
-	ws    *ioutils.AtomicWriteSet
+	store   *fileMetadataStore
+	ws      *ioutils.AtomicWriteSet
+	cacheID string
 }
 
 // newFSMetadataStore returns an instance of a metadata store
@@ -95,7 +96,18 @@ func (fm *fileMetadataTransaction) SetDiffID(diff DiffID) error {
 }
 
 func (fm *fileMetadataTransaction) SetCacheID(cacheID string) error {
-	return fm.ws.WriteFile("cache-id", []byte(cacheID), 0644)
+	if fm.cacheID != "" {
+		if fm.cacheID != cacheID {
+			return fmt.Errorf("transaction cache-id changed from %s to %s", fm.cacheID, cacheID)
+		}
+		// Never truncate a cache-id already persisted as allocation intent.
+		return nil
+	}
+	if err := fm.ws.WriteFile("cache-id", []byte(cacheID), 0644); err != nil {
+		return err
+	}
+	fm.cacheID = cacheID
+	return nil
 }
 
 func (fm *fileMetadataTransaction) SetDescriptor(ref distribution.Descriptor) error {
@@ -111,16 +123,16 @@ func (fm *fileMetadataTransaction) TarSplitWriter(compressInput bool) (io.WriteC
 	if err != nil {
 		return nil, err
 	}
-	var wc io.WriteCloser
-	if compressInput {
-		wc = gzip.NewWriter(f)
-	} else {
-		wc = f
+	if !compressInput {
+		return f, nil
 	}
-
+	wc := gzip.NewWriter(f)
 	return ioutils.NewWriteCloserWrapper(wc, func() error {
-		wc.Close()
-		return f.Close()
+		err := wc.Close()
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+		return err
 	}), nil
 }
 
@@ -131,6 +143,47 @@ func (fm *fileMetadataTransaction) Commit(layer ChainID) error {
 	}
 
 	return fm.ws.Commit(finalDir)
+}
+
+func (fm *fileMetadataTransaction) SyncIntent(syncDir func(string) error) error {
+	for _, dir := range []string{fm.ws.String(), filepath.Dir(fm.ws.String()), fm.store.root} {
+		if err := syncDir(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CommitDurable tells the caller whether the rename took place, even when
+// durability cannot be confirmed. Callers must not remove the driver layer in
+// that case.
+func (fm *fileMetadataTransaction) CommitDurable(layer ChainID, syncDir func(string) error) (renamed bool, err error) {
+	finalDir := fm.store.getLayerDirectory(layer)
+	destination := filepath.Dir(finalDir)
+	if err := os.MkdirAll(destination, 0755); err != nil {
+		return false, err
+	}
+	if _, err := os.Lstat(finalDir); err == nil {
+		return false, fmt.Errorf("layer metadata already exists: %s", finalDir)
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	staged := fm.ws.String()
+	if err := syncDir(staged); err != nil {
+		return false, err
+	}
+	if err := syncDir(fm.store.root); err != nil {
+		return false, err
+	}
+	if err := fm.ws.Commit(finalDir); err != nil {
+		return false, err
+	}
+	for _, dir := range []string{destination, filepath.Dir(staged)} {
+		if err := syncDir(dir); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
 }
 
 func (fm *fileMetadataTransaction) Cancel() error {

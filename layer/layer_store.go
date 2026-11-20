@@ -11,6 +11,7 @@ import (
 	"github.com/docker/distribution"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/pkg/idtools"
+	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/pkg/system"
@@ -35,6 +36,11 @@ type layerStore struct {
 
 	layerMap map[ChainID]*roLayer
 	layerL   sync.Mutex
+	// Quarantine layerdb renames whose durability could not be confirmed.
+	// Guarded by layerL. Parent references remain pinned until restart.
+	uncertain map[ChainID]error
+	syncDir   func(string) error
+	syncFS    func(*os.File) error
 
 	mounts map[string]*mountedLayer
 	mountL sync.Mutex
@@ -73,7 +79,29 @@ func NewStoreFromOptions(options StoreOptions) (Store, error) {
 
 	root := fmt.Sprintf(options.MetadataStorePathTemplate, driver)
 
+	if _, durable := driver.(layerWriteBarrier); durable {
+		if err := os.MkdirAll(root, 0700); err != nil {
+			return nil, err
+		}
+		if err := ioutils.SyncDirChain(root, options.Root); err != nil {
+			return nil, err
+		}
+		// After an ordinary daemon restart (no reboot) a prior rename may
+		// be visible while still awaiting writeback. Flush before loading it.
+		f, err := os.Open(root)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		if err := ioutils.SyncFilesystem(f); err != nil {
+			return nil, err
+		}
+	}
 	return newStoreFromGraphDriver(root, driver, options.OS)
+}
+
+type layerWriteBarrier interface {
+	OpenLayerWriteBarrier() (*os.File, error)
 }
 
 // newStoreFromGraphDriver creates a new Store instance using the provided
@@ -97,6 +125,9 @@ func newStoreFromGraphDriver(root string, driver graphdriver.Driver, os string) 
 		store:       ms,
 		driver:      driver,
 		layerMap:    map[ChainID]*roLayer{},
+		uncertain:   map[ChainID]error{},
+		syncDir:     ioutils.SyncDir,
+		syncFS:      ioutils.SyncFilesystem,
 		mounts:      map[string]*mountedLayer{},
 		locker:      locker.New(),
 		useTarSplit: !caps.ReproducesExactDiffs,
@@ -246,7 +277,7 @@ func (ls *layerStore) loadMount(mount string) error {
 	return nil
 }
 
-func (ls *layerStore) applyTar(tx *fileMetadataTransaction, ts io.Reader, parent string, layer *roLayer) error {
+func (ls *layerStore) applyTar(tx *fileMetadataTransaction, ts io.Reader, parent string, layer *roLayer) (retErr error) {
 	digester := digest.Canonical.Digester()
 	tr := io.TeeReader(ts, digester.Hash())
 
@@ -257,7 +288,11 @@ func (ls *layerStore) applyTar(tx *fileMetadataTransaction, ts io.Reader, parent
 			return err
 		}
 		metaPacker := storage.NewJSONPacker(tsw)
-		defer tsw.Close()
+		defer func() {
+			if err := tsw.Close(); retErr == nil {
+				retErr = err
+			}
+		}()
 
 		// we're passing nil here for the file putter, because the ApplyDiff will
 		// handle the extraction of the archive
@@ -271,9 +306,12 @@ func (ls *layerStore) applyTar(tx *fileMetadataTransaction, ts io.Reader, parent
 	// discard trailing data but ensure metadata is picked up to reconstruct stream
 	// unconditionally call io.Copy here before checking err to ensure the resources
 	// allocated by NewInputTarStream above are always released
-	io.Copy(io.Discard, rdr) // ignore error as reader may be closed
+	_, drainErr := io.Copy(io.Discard, rdr)
 	if err != nil {
 		return err
+	}
+	if drainErr != nil {
+		return drainErr
 	}
 
 	layer.size = applySize
@@ -295,6 +333,7 @@ func (ls *layerStore) registerWithDescriptor(ts io.Reader, parent ChainID, descr
 	var err error
 	var pid string
 	var p *roLayer
+	var renamed bool
 
 	if string(parent) != "" {
 		p = ls.get(parent)
@@ -304,7 +343,7 @@ func (ls *layerStore) registerWithDescriptor(ts io.Reader, parent ChainID, descr
 		pid = p.cacheID
 		// Release parent chain if error
 		defer func() {
-			if err != nil {
+			if err != nil && !renamed {
 				ls.layerL.Lock()
 				ls.releaseLayer(p)
 				ls.layerL.Unlock()
@@ -326,26 +365,49 @@ func (ls *layerStore) registerWithDescriptor(ts io.Reader, parent ChainID, descr
 		descriptor:     descriptor,
 	}
 
-	if err = ls.driver.Create(layer.cacheID, pid, nil); err != nil {
-		return nil, err
-	}
-
 	tx, err := ls.store.StartTransaction()
 	if err != nil {
 		return nil, err
 	}
 
+	var created, keepIntent bool
 	defer func() {
-		if err != nil {
-			logrus.Debugf("Cleaning up layer %s: %v", layer.cacheID, err)
-			if err := ls.driver.Remove(layer.cacheID); err != nil {
-				logrus.Errorf("Error cleaning up cache layer %s: %v", layer.cacheID, err)
-			}
-			if err := tx.Cancel(); err != nil {
-				logrus.Errorf("Error canceling metadata transaction %q: %s", tx.String(), err)
+		if err == nil || renamed || keepIntent {
+			return
+		}
+		if created {
+			if removeErr := ls.driver.Remove(layer.cacheID); removeErr != nil {
+				logrus.Errorf("Error cleaning up cache layer %s: %v", layer.cacheID, removeErr)
+				return // retain the intent for startup reporting
 			}
 		}
+		if cancelErr := tx.Cancel(); cancelErr != nil {
+			logrus.Errorf("Error canceling metadata transaction %q: %s", tx.String(), cancelErr)
+		}
 	}()
+
+	barrier, durable := ls.driver.(layerWriteBarrier)
+	var backing *os.File
+	if durable {
+		if err = tx.SetCacheID(layer.cacheID); err != nil {
+			return nil, err
+		}
+		if err = tx.SyncIntent(ls.syncDir); err != nil {
+			return nil, err
+		}
+		backing, err = barrier.OpenLayerWriteBarrier()
+		if err != nil {
+			return nil, err
+		}
+		defer backing.Close()
+	}
+	if err = ls.driver.Create(layer.cacheID, pid, nil); err != nil {
+		// Create may have left data behind, or failed because the ID
+		// already existed. Do not remove a layer we did not create.
+		keepIntent = durable
+		return nil, err
+	}
+	created = true
 
 	if err = ls.applyTar(tx, ts, pid, layer); err != nil {
 		return nil, err
@@ -361,16 +423,35 @@ func (ls *layerStore) registerWithDescriptor(ts io.Reader, parent ChainID, descr
 		return nil, err
 	}
 
+	if durable {
+		if err = ls.syncFS(backing); err != nil {
+			return nil, err
+		}
+	}
+
 	ls.layerL.Lock()
 	defer ls.layerL.Unlock()
 
+	if err = ls.uncertain[layer.chainID]; err != nil {
+		return nil, err
+	}
 	if existingLayer := ls.getWithoutLock(layer.chainID); existingLayer != nil {
 		// Set error for cleanup, but do not return the error
 		err = errors.New("layer already exists")
 		return existingLayer.getReference(), nil
 	}
 
-	if err = tx.Commit(layer.chainID); err != nil {
+	if durable {
+		renamed, err = tx.CommitDurable(layer.chainID, ls.syncDir)
+		if err != nil && renamed {
+			err = fmt.Errorf("layer %s published but durability is unknown; restart dockerd to reconcile: %w", layer.chainID, err)
+			ls.uncertain[layer.chainID] = err
+			logrus.Error(err)
+		}
+	} else {
+		err = tx.Commit(layer.chainID)
+	}
+	if err != nil {
 		return nil, err
 	}
 
@@ -400,6 +481,9 @@ func (ls *layerStore) Get(l ChainID) (Layer, error) {
 	ls.layerL.Lock()
 	defer ls.layerL.Unlock()
 
+	if err := ls.uncertain[l]; err != nil {
+		return nil, err
+	}
 	layer := ls.getWithoutLock(l)
 	if layer == nil {
 		return nil, ErrLayerDoesNotExist

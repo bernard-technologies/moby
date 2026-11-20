@@ -714,6 +714,12 @@ func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64
 	return directory.Size(context.TODO(), applyDir)
 }
 
+// OpenLayerWriteBarrier opens the backing filesystem before Create and ApplyDiff.
+// The caller must sync this fd before publishing the layer metadata.
+func (d *Driver) OpenLayerWriteBarrier() (*os.File, error) {
+	return os.Open(d.home)
+}
+
 // LayerDirectories lists real directories for report-only startup diagnostics.
 // An entry in this list says nothing about ownership.
 func (d *Driver) LayerDirectories() ([]string, error) {

@@ -117,6 +117,9 @@ func (ls *layerStore) RegisterByGraphID(graphID string, parent ChainID, diffID D
 	ls.layerL.Lock()
 	defer ls.layerL.Unlock()
 
+	if err = ls.uncertain[layer.chainID]; err != nil {
+		return nil, err
+	}
 	if existingLayer := ls.getWithoutLock(layer.chainID); existingLayer != nil {
 		// Set error for cleanup, but do not return
 		err = errors.New("layer already exists")
@@ -141,13 +144,16 @@ func (ls *layerStore) RegisterByGraphID(graphID string, parent ChainID, diffID D
 	if err != nil {
 		return nil, err
 	}
-	defer tsw.Close()
 	tdf, err := os.Open(tarDataFile)
 	if err != nil {
+		tsw.Close()
 		return nil, err
 	}
 	defer tdf.Close()
 	_, err = io.Copy(tsw, tdf)
+	if closeErr := tsw.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		return nil, err
 	}
