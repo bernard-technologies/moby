@@ -614,7 +614,10 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 	}
 
 	if err := mount("overlay", mountTarget, "overlay", 0, mountData); err != nil {
-		return nil, fmt.Errorf("error creating overlay mount to %s: %v", mergedDir, err)
+		if diagErr := d.diagnoseLayer(id); diagErr != nil {
+			return nil, fmt.Errorf("error creating overlay mount to %s: %v (metadata check: %w)", mergedDir, err, diagErr)
+		}
+		return nil, fmt.Errorf("error creating overlay mount to %s: %v (overlay2 metadata looks valid)", mergedDir, err)
 	}
 
 	if !readonly {

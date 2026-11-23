@@ -44,6 +44,9 @@ type layerStore struct {
 
 	mounts map[string]*mountedLayer
 	mountL sync.Mutex
+	// Mount records renamed into place whose durability could not be
+	// confirmed. Guarded by mountL. Their layers and parents stay pinned.
+	uncertainMounts map[string]error
 
 	// protect *RWLayer() methods from operating on the same name/id
 	locker *locker.Locker
@@ -122,16 +125,17 @@ func newStoreFromGraphDriver(root string, driver graphdriver.Driver, os string) 
 	}
 
 	ls := &layerStore{
-		store:       ms,
-		driver:      driver,
-		layerMap:    map[ChainID]*roLayer{},
-		uncertain:   map[ChainID]error{},
-		syncDir:     ioutils.SyncDir,
-		syncFS:      ioutils.SyncFilesystem,
-		mounts:      map[string]*mountedLayer{},
-		locker:      locker.New(),
-		useTarSplit: !caps.ReproducesExactDiffs,
-		os:          os,
+		store:           ms,
+		driver:          driver,
+		layerMap:        map[ChainID]*roLayer{},
+		uncertain:       map[ChainID]error{},
+		syncDir:         ioutils.SyncDir,
+		syncFS:          ioutils.SyncFilesystem,
+		mounts:          map[string]*mountedLayer{},
+		uncertainMounts: map[string]error{},
+		locker:          locker.New(),
+		useTarSplit:     !caps.ReproducesExactDiffs,
+		os:              os,
 	}
 
 	ids, mounts, err := ms.List()
@@ -609,13 +613,18 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 
 	ls.mountL.Lock()
 	_, ok := ls.mounts[name]
+	uncertainErr := ls.uncertainMounts[name]
 	ls.mountL.Unlock()
+	if uncertainErr != nil {
+		return nil, uncertainErr
+	}
 	if ok {
 		return nil, ErrMountNameConflict
 	}
 
 	var pid string
 	var p *roLayer
+	var published bool
 	if string(parent) != "" {
 		p = ls.get(parent)
 		if p == nil {
@@ -623,9 +632,10 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 		}
 		pid = p.cacheID
 
-		// Release parent chain if error
+		// Release parent chain if error, unless a mount record that pins
+		// it may have been published.
 		defer func() {
-			if err != nil {
+			if err != nil && !published {
 				ls.layerL.Lock()
 				ls.releaseLayer(p)
 				ls.layerL.Unlock()
@@ -639,6 +649,12 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 		mountID:    ls.mountID(name),
 		layerStore: ls,
 		references: map[RWLayer]*referencedRWLayer{},
+	}
+
+	if barrier, durable := ls.driver.(layerWriteBarrier); durable {
+		var rw RWLayer
+		rw, published, err = ls.createRWLayerDurable(barrier, m, pid, mountLabel, initFunc, storageOpt)
+		return rw, err
 	}
 
 	if initFunc != nil {
@@ -663,13 +679,102 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 	return m.getReference(), nil
 }
 
+// createRWLayerDurable records intent before creating driver layers, flushes
+// both layers, and publishes all mount metadata with one directory rename.
+// The caller holds the name lock and releases the parent on error unless
+// publication may have happened.
+func (ls *layerStore) createRWLayerDurable(barrier layerWriteBarrier, m *mountedLayer, pid, mountLabel string, initFunc MountInit, storageOpt map[string]string) (_ RWLayer, renamed bool, err error) {
+	if initFunc != nil {
+		m.initID = initLayerID(m.mountID)
+	}
+	var parent ChainID
+	if m.parent != nil {
+		parent = m.parent.chainID
+	}
+	tx, err := ls.store.StartMountTransaction(m.name, m.mountID, m.initID, parent)
+	if err != nil {
+		return nil, renamed, err
+	}
+	var created []string
+	var keepIntent bool
+	defer func() {
+		if err == nil || renamed || keepIntent {
+			return
+		}
+		// The IDs were freshly allocated for this attempt. Remove in reverse
+		// order; keep the intent if any of them cannot be removed.
+		for i := len(created) - 1; i >= 0; i-- {
+			if removeErr := ls.driver.Remove(created[i]); removeErr != nil {
+				logrus.WithError(removeErr).WithField("mount", m.name).Errorf("Error cleaning up layer %s", created[i])
+				return
+			}
+		}
+		if cancelErr := tx.Cancel(); cancelErr != nil {
+			logrus.Errorf("Error canceling mount transaction %q: %s", tx.String(), cancelErr)
+		}
+	}()
+	if err = tx.SyncIntent(ls.syncDir); err != nil {
+		return nil, renamed, err
+	}
+	backing, err := barrier.OpenLayerWriteBarrier()
+	if err != nil {
+		return nil, renamed, err
+	}
+	defer backing.Close()
+
+	if initFunc != nil {
+		createOpts := &graphdriver.CreateOpts{MountLabel: mountLabel, StorageOpt: storageOpt}
+		if err = ls.driver.CreateReadWrite(m.initID, pid, createOpts); err != nil {
+			// Create may have left data behind, or found an existing ID.
+			keepIntent = true
+			return nil, renamed, err
+		}
+		created = append(created, m.initID)
+		if err = ls.populateInitLayer(m.initID, initFunc); err != nil {
+			return nil, renamed, err
+		}
+		pid = m.initID
+	}
+	if err = ls.driver.CreateReadWrite(m.mountID, pid, &graphdriver.CreateOpts{StorageOpt: storageOpt}); err != nil {
+		keepIntent = true
+		return nil, renamed, err
+	}
+	created = append(created, m.mountID)
+
+	// Persist both layer layouts, including l/ links and the init content.
+	if err = ls.syncFS(backing); err != nil {
+		return nil, renamed, err
+	}
+
+	ls.mountL.Lock()
+	defer ls.mountL.Unlock()
+	if _, ok := ls.mounts[m.name]; ok {
+		return nil, false, ErrMountNameConflict
+	}
+	renamed, err = tx.CommitMountDurable(m.name, ls.syncDir)
+	if err != nil {
+		if renamed {
+			err = fmt.Errorf("mount %s published but durability is unknown; restart dockerd to reconcile: %w", m.name, err)
+			ls.uncertainMounts[m.name] = err
+			logrus.Error(err)
+		}
+		return nil, renamed, err
+	}
+	ls.mounts[m.name] = m
+	return m.getReference(), true, nil
+}
+
 func (ls *layerStore) GetRWLayer(id string) (RWLayer, error) {
 	ls.locker.Lock(id)
 	defer ls.locker.Unlock(id)
 
 	ls.mountL.Lock()
 	mount := ls.mounts[id]
+	uncertainErr := ls.uncertainMounts[id]
 	ls.mountL.Unlock()
+	if uncertainErr != nil {
+		return nil, uncertainErr
+	}
 	if mount == nil {
 		return nil, ErrMountDoesNotExist
 	}
@@ -772,7 +877,7 @@ func (ls *layerStore) initMount(graphID, parent, mountLabel string, initFunc Mou
 	// which are expecting this layer with this special name. If all
 	// graph drivers can be updated to not rely on knowing about this layer
 	// then the initID should be randomly generated.
-	initID := fmt.Sprintf("%s-init", graphID)
+	initID := initLayerID(graphID)
 
 	createOpts := &graphdriver.CreateOpts{
 		MountLabel: mountLabel,
@@ -782,21 +887,28 @@ func (ls *layerStore) initMount(graphID, parent, mountLabel string, initFunc Mou
 	if err := ls.driver.CreateReadWrite(initID, parent, createOpts); err != nil {
 		return "", err
 	}
+	if err := ls.populateInitLayer(initID, initFunc); err != nil {
+		return "", err
+	}
+	return initID, nil
+}
+
+func initLayerID(mountID string) string {
+	return fmt.Sprintf("%s-init", mountID)
+}
+
+func (ls *layerStore) populateInitLayer(initID string, initFunc MountInit) error {
 	p, err := ls.driver.Get(initID, "")
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	if err := initFunc(p); err != nil {
 		ls.driver.Put(initID)
-		return "", err
+		return err
 	}
 
-	if err := ls.driver.Put(initID); err != nil {
-		return "", err
-	}
-
-	return initID, nil
+	return ls.driver.Put(initID)
 }
 
 func (ls *layerStore) getTarStream(rl *roLayer) (io.ReadCloser, error) {

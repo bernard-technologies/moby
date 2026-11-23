@@ -1339,7 +1339,7 @@ func (daemon *Daemon) Mount(container *container.Container) error {
 	}
 	dir, err := container.RWLayer.Mount(container.GetMountLabel())
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "mount root filesystem of container %s", container.ID)
 	}
 	logrus.WithField("container", container.ID).Debugf("container mounted via layerStore: %v", dir)
 

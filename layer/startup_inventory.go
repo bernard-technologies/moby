@@ -27,7 +27,12 @@ func (ls *layerStore) reportInterruptedLayers(scanner interface{ LayerDirectorie
 		}
 		staged++
 		if staged <= detailLimit {
-			logrus.WithField("transaction", entry.Name()).Warn("Staged layer transaction left untouched")
+			fields := logrus.Fields{"transaction": entry.Name()}
+			if name, err := os.ReadFile(filepath.Join(ls.store.root, "tmp", entry.Name(), "mount-name")); err == nil {
+				// Interrupted container create; the mount record was never published.
+				fields["container"] = string(name)
+			}
+			logrus.WithFields(fields).Warn("Staged layer transaction left untouched")
 		}
 	}
 

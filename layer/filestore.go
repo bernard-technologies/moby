@@ -186,6 +186,70 @@ func (fm *fileMetadataTransaction) CommitDurable(layer ChainID, syncDir func(str
 	return true, nil
 }
 
+// StartMountTransaction stages a complete mount record under tmp. The staged
+// files are the allocation intent: they name the planned driver layers before
+// either layer is created. Stock dockerd ignores tmp, so a stage is never
+// mistaken for a container mount.
+func (fms *fileMetadataStore) StartMountTransaction(mount, mountID, initID string, parent ChainID) (*fileMetadataTransaction, error) {
+	tx, err := fms.StartTransaction()
+	if err != nil {
+		return nil, err
+	}
+	write := func(name, value string) error {
+		return tx.ws.WriteFile(name, []byte(value), 0644)
+	}
+	err = write("mount-name", mount)
+	if err == nil {
+		err = write("mount-id", mountID)
+	}
+	if err == nil && initID != "" {
+		err = write("init-id", initID)
+	}
+	if err == nil && parent != "" {
+		err = write("parent", digest.Digest(parent).String())
+	}
+	if err != nil {
+		tx.Cancel()
+		return nil, err
+	}
+	return tx, nil
+}
+
+// CommitMountDurable publishes a staged mount record only if none exists. As
+// with CommitDurable, renamed reports publication even if a later directory
+// sync fails.
+func (fm *fileMetadataTransaction) CommitMountDurable(mount string, syncDir func(string) error) (renamed bool, err error) {
+	finalDir := fm.store.getMountDirectory(mount)
+	destination := filepath.Dir(finalDir)
+	if err := os.MkdirAll(destination, 0755); err != nil {
+		return false, err
+	}
+	if err := syncDir(destination); err != nil {
+		return false, err
+	}
+	if err := syncDir(fm.store.root); err != nil {
+		return false, err
+	}
+	if _, err := os.Lstat(finalDir); err == nil {
+		return false, fmt.Errorf("mount metadata already exists: %s", finalDir)
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	staged := fm.ws.String()
+	if err := syncDir(staged); err != nil {
+		return false, err
+	}
+	if err := fm.ws.Commit(finalDir); err != nil {
+		return false, err
+	}
+	for _, dir := range []string{destination, filepath.Dir(staged)} {
+		if err := syncDir(dir); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
 func (fm *fileMetadataTransaction) Cancel() error {
 	return fm.ws.Cancel()
 }
