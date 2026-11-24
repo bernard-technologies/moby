@@ -197,7 +197,7 @@ func (daemon *Daemon) getInspectData(container *container.Container) (*types.Con
 	// we can ignore the error if the container is dead.
 	if err != nil {
 		if !container.Dead {
-			return nil, errdefs.System(err)
+			return nil, errdefs.System(fmt.Errorf("read root filesystem metadata of container %s: %w", container.ID, err))
 		}
 	} else {
 		contJSONBase.GraphDriver.Data = graphDriverData

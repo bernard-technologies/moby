@@ -98,3 +98,30 @@ func TestDiagnoseLayer(t *testing.T) {
 		})
 	}
 }
+
+func TestDamagedMetadataErrors(t *testing.T) {
+	const baseLID, childLID = "AAAAAAAAAAAAAAAAAAAAAAAAAA", "BBBBBBBBBBBBBBBBBBBBBBBBBB"
+	d := &Driver{home: t.TempDir()}
+	if err := os.Mkdir(path.Join(d.home, linkDir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeLayer(t, d, "base", baseLID, "")
+	writeLayer(t, d, "child", childLID, path.Join(linkDir, baseLID))
+
+	// GetMetadata (used by inspect and start) reports the malformed entry.
+	os.WriteFile(path.Join(d.dir("child"), lowerFile), nil, 0644)
+	if _, err := d.GetMetadata("child"); err == nil || !strings.Contains(err.Error(), "empty lower") {
+		t.Fatalf("GetMetadata error lacks diagnosis: %v", err)
+	}
+
+	// A child is never created on a parent with an empty or dangling link.
+	os.WriteFile(path.Join(d.dir("base"), "link"), nil, 0644)
+	if _, err := d.getLower("base"); err == nil || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("lower derived from empty parent link: %v", err)
+	}
+	os.WriteFile(path.Join(d.dir("base"), "link"), []byte(baseLID), 0644)
+	os.Remove(path.Join(d.home, linkDir, baseLID))
+	if _, err := d.getLower("base"); err == nil || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("lower derived from dangling parent link: %v", err)
+	}
+}

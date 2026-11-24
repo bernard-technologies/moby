@@ -300,6 +300,9 @@ func (d *Driver) GetMetadata(id string) (map[string]string, error) {
 
 	lowerDirs, err := d.getLowerDirs(id)
 	if err != nil {
+		if diagErr := d.diagnoseLayer(id); diagErr != nil {
+			return nil, fmt.Errorf("%v (metadata check: %w)", err, diagErr)
+		}
 		return nil, err
 	}
 	if len(lowerDirs) > 0 {
@@ -463,6 +466,14 @@ func (d *Driver) getLower(parent string) (string, error) {
 	parentLink, err := os.ReadFile(path.Join(parentDir, "link"))
 	if err != nil {
 		return "", err
+	}
+	// Never write a lower entry that cannot resolve: an empty parent link
+	// would produce a child whose lower names the l/ directory itself.
+	if len(parentLink) == 0 || strings.ContainsAny(string(parentLink), "/:") {
+		return "", fmt.Errorf("refusing to create layer on parent %s: invalid link file content %q", parent, parentLink)
+	}
+	if _, err := os.Lstat(path.Join(d.home, linkDir, string(parentLink))); err != nil {
+		return "", fmt.Errorf("refusing to create layer on parent %s: %w", parent, err)
 	}
 	lowers := []string{path.Join(linkDir, string(parentLink))}
 
